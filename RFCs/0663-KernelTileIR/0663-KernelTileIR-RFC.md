@@ -41,6 +41,7 @@ This MLIR layer is intended to play as an interface between a frontend and a bac
     - [kt.grid_index](#ktgrid_index)
     - [kt.layout](#ktlayout)
     - [kt.load](#ktload)
+    - [kt.offset_range](#ktoffset_range)
     - [kt.store](#ktstore)
     - [kt.tile_access](#kttile_access)
     - [kt.tile_grid_access](#kttile_grid_access)
@@ -158,6 +159,26 @@ Example:
 %tile = kt.load %tile_ref : tileref<32x64xf16> -> tensor<32x64xf16>
 ```
 
+#### kt.offset_range
+
+The `kt.offset_rage` operation computes a tensor to represent a set of offsets to be used for indrect tile accesses. It takes an affine map with one or more 1-dimensional tensors and/or scalar values. The map is applied to those inputs to produce a tensor of offsets. An input tensor can be an index tensor obtained from an index tile on memory where the map maps each tensor index to an address offset. Alternatively, an input tensor can be a range of tensor indexes computed from [kt.arange](#kt.arange) where the map maps each tensor index with one or more optional scalar inputs to an address offset. These output tensors are intended to be used for indirect tile accesses though [kt.tile_indirect_access](#kt.tile_indirect_access).
+
+Syntax:
+```
+operation ::= kt.offset_range #map (tensor) : tensorType,... -> tensorType
+  | kt.offset_range #map (scalar|tensor,...) : i32|tensorType,... -> tensorType
+```
+
+Example:
+```
+#map1 = affine_map<(d0) -> (d0 * 1024)>
+%offset_0 = kt.offset_range #map1 (%index_coretile) : tensor<128xi32> -> tensor<128xi32>
+
+%arange_0_256 = kt.arange %c0, %c256 : tensor<256xi32>
+#map2 = affine_map<(d0, d1) : (d0 * 256 + d1)>
+%offset_1 = kt.offset_range #map2 (%index_1, %arange_0_256) : i32, tensor<256xi32> -> tensor<256xi32>
+```
+
 #### kt.store
 
 The `kt.store` operation stores a tensor as a `srcTile` object or a tile at `srcTileRef` to a tile at `dstTileRef`. It retuns the destination tileref where the tensor object is stored.
@@ -214,26 +235,32 @@ Example:
 
 #### kt.tile_indirect_access
 
-The `kt.tile_indirect_access` operation extracts a sub tile from `srcTileRef` where the address offset of each element is obtained from `offsetTensors` to return a `tileref` object as a reference to the sub tile. An offset tensor `offsetTensor` is a block offset for a dimension of `srcTileRef`. Each element in an offset tensor is typically obtained from an index of a dimension multiplied by the stride of the dimension. The index value is typically obtained from an index tile for an indirectly indexed dimension or from a range of indexes for a directly indexed dimension.
+The `kt.tile_indirect_access` operation extracts a sub tile from `srcTileRef` where the address offset of each element is obtained from `offsetTensors` to return a `tileref` object as a reference to the sub tile. Each offset tensor `offsetTensor` is a block offset for a dimension of `srcTileRef`. The offset tensor is typically obtained from [kt.offset_ranges](#kt.offset_ranges) with an index tensor extracted from an index tile or an index range obtained from [kt.arange](kt.arange).
+
+Each element in the offset tensor is typically obtained from an index of a dimension multiplied by the stride of the dimension. The index value is typically obtained from an index tile for an indirectly indexed dimension or from a range of indexes for a directly indexed dimension.
 
 Syntax:
 ```
-operation ::= kt.tile_indirect_access srcTileRef, offsetTensors : tileref, [tensor] -> tileref
+operation ::= kt.tile_indirect_access srcTileRef, [offsetTensors] : tilerefType, [tensorTypes] -> tilerefType
 ```
 
 Example;
 ```
-// #set4 = affine_set<(d0) : (0 <= d0 < 128)>
-%index_subtile_ref = kt.tile_grid_access %index_tile_ref, [%grid0] { access_tile_set = #set4 } : tileref<512xi32>, [i32] -> tileref<128xi32>
-%index_subtile = kt.load %index_subtile_ref : tileref<128xi32> -> tensor<128xi32>
-%stride1 = tensor.splat %c1024 : tensor<128xi32>
-%offset1 = arith.muli %index_subtile, %stride1 : tensor<128xi32>, tensor<128xi32> -> tensor<128xi32> // a series of address offsets for dimension 1
+%grid0 = kt.grid_index {dim = 0 : i32} -> i32
+%grid1 = kt.grid_index {dim = 1 : i32} -> i32
 
-%start = arith.muli %grid1, %c256 : i32, i32 -> i32
-%end = aith.addi %start, %c256 : i32, i32 -> i32
-%offset0 = kt.arange %start, %end -> tensor<256xi32> // a series of address offsets for dimension 0
+#set4 = affine_set<(d0) : (0 <= d0 < 128)>
+%index_coretile_ref = kt.tile_grid_access %index_tile_ref, [%grid0] { access_tile_set = #set4 } : memref<512xi32>, [i32] -> tileref<128xi32>
+%index_coretile = kt.load %index_coretile_ref : tileref<128xi32> -> tensor<128xi32>
 
-%dst_coretile_ref = kt.tile_indirect_access %dst_tile_ref, [%offset1, %offset0] : tileref<512x1024xf16>, [tensor<128xi32>, tensor<256xi32>] -> tileref<128x256xf16>
+#map1 = affine_map<(d0) -> (d0 * 1024)>
+%offset_0 = kt.offset_range #map1 (%index_coretile) : tensor<128xi32> -> tensor<128xi32>
+%arange_0_256 = kt.arange %c0, %c256 : tensor<256xi32>
+#map2 = affine_map<(d0, d1) : (d0 * 256 + d1)>
+%offset_1 = kt.offset_range #map2 (%grid1, %arange_0_256) : i32, tensor<256xi32> -> tensor<256xi32>
+
+%coretile_ref = kt.tile_indirect_access %base_tile_ref, [%offset_0, %offset_1] : tileref<512x1024xf16>, [tensor<128xi32>, tensor<256xi32>] -> tileref<128x256xf16>
+
 ```
 
 #### kt.tile_view
@@ -325,16 +352,15 @@ module {
 // OriginalTile: [512, 1024], OriginalIndexTile: [512]
 // CoreTile: [128, 256] * 4 * 4, IndexCoreTile: [128] * 4
 #set1 = affine_set<(d0, d1) : (0 <= d0 < 512, 0 <= d1 < 1024)>
-#set2 = affine_set<(d0, d1) : (0 <= d0 < 512, 0 <= d1 < 1)>
+#set2 = affine_set<(d0) : (0 <= d0 < 512)>
 #set3 = affine_set<(d0, d1) : (0 <= d0 < 128, 0 <= d1 < 256)>
-#set4 = affine_set<(d0, d1) : (0 <= d0 < 128, 0 <= d1 < 1)>
-#set5 = affine_set<(d0) : (0 <= d0 < 256)>
-#set6 = affine_set<(d0) : (0 <= d0 < 128)>
+#set4 = affine_set<(d0) : (0 <= d0 < 128)>
+#map1 = affine_map<(d0) -> (d0 * 1024)>
+#map2 = affine_map<(d0, d1) : (d0 * 256 + d1)>
 module {
   func.func @indexcopy(%src_ptr: index, %dst_ptr: index, %index_ptr: index) -> index attributes { grid = [4, 4] }  {
     %c0_index = arith.constant 0 : index
     %c256 = arith.constant 256 : i32
-    %c1024 = arith.constant 1024 : i32
 
     // Original tiles
     // #set1 = affine_set<(d0, d1) : (0 <= d0 < 512, 0 <= d1 < 1024)>
@@ -368,14 +394,14 @@ module {
     // #set4 = affine_set<(d0) : (0 <= d0 < 128)>
     %index_coretile_ref = kt.tile_grid_access %index_tile_ref, [%grid0] { access_tile_set = #set4 } : memref<512xi32>, [i32] -> tileref<128xi32>
     %index_coretile = kt.load %index_coretile_ref : tileref<128xi32> -> tensor<128xi32>
-    %stride1 = tensor.splat %c1024 : tensor<128xi32>
-    %offset1 = arith.muli %index_coretile, %stride1 : tensor<128xi32>, tensor<128xi32> -> tensor<128xi32>
 
-    %start = arith.muli %grid1, %c256 : i32, i32 -> i32
-    %end = aith.addi %start, %c256 : i32, i32 -> i32
-    %offset0 = kt.arange %start, %end -> tensor<256xi32>
+    // #map1 = affine_map<(d0) -> (d0 * 1024)>
+    %offset_0 = kt.offset_range #map1 (%index_coretile) : tensor<128xi32> -> tensor<128xi32>
+    %arange_0_256 = kt.arange %c0, %c256 : tensor<256xi32>
+    // #map2 = affine_map<(d0, d1) : (d0 * 256 + d1)>
+    %offset_1 = kt.offset_range #map2 (%grid1, %arange_0_256) : i32, tensor<256xi32> -> tensor<256xi32>
 
-    %dst_coretile_ref = kt.tile_indirect_access %dst_tile_ref, [%offset1, %offset0] : tileref<512x1024xf16>, [tensor<128xi32>, tensor<256xi32>] -> tileref<128x256xf16>
+    %dst_coretile_ref = kt.tile_indirect_access %dst_tile_ref, [%offset_1, %offset_0] : tileref<512x1024xf16>, [tensor<128xi32>, tensor<256xi32>] -> tileref<128x256xf16>
 
     kt.store %src_coretile, %dst_coretile_ref : tensor<128x256xf16>, tileref<128x256xf16>
 
