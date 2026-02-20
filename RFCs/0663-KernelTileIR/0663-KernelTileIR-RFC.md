@@ -418,9 +418,108 @@ Coming soon
 
 #### paged_attention
 
-```mlir
-Coming soon
+This example represents a part of a [paged attention kernel](https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/ops/triton_unified_attention.py) from vLLM to load a query tensor indirectly through an index tensor.
+
+Here is a simplified version of Triton code to load the query tensor.
+
 ```
+# Assume that BLOCK_M equals to num_queries_per_kv
+@triton.jit
+def kernel_unified_attention_2d_query_load(
+    query_ptr,                      # [524288, 128] [2048, 256, 128] [num_tokens, num_query_heads, head_size]
+    Q_lx_ptr,                       # [32, 128] [BLOCK_M, HEAD_SIZE_PADDED]
+    HEAD_SIZE_PADDED: tl.constexpr, # 128, int, must be power of 2
+    BLOCK_M: tl.constexpr,          # 32, int
+
+    query_offset_ptr,               # [2, 256] [num_seqs, BLOCK_M * NumGrid0]
+):
+    q_block_global_idx = tl.program_id(0)
+    kv_head_idx = tl.program_id(1)
+
+    query_offset = tl.load(tl.make_block_ptr(query_offset_ptr, shape=[2, 256], strides=[256, 1], block_shape=[1, BLOCK_M], order=[0, 1], offsets=[q_block_global_idx, kv_head_idx * BLOCK_M]))
+    query_offset = tl.broadcast_to(query_offset, [BLOCK_M])
+
+    offs_d = tl.arange(0, HEAD_SIZE_PADDED)
+    query_offset = (
+        query_offset[:, None],
+        + offs_d[None, :]
+    )
+
+    # Q : (BLOCK_M, HEAD_SIZE_PADDED)
+    Q = tl.load(query_ptr + query_offset)
+
+    tl.store(tl.make_block_ptr(Q_lx_ptr, shape=[32, 128], strides=[128, 1], block_shape=[32, 128], order=[0, 1], offsets=[0, 0]), Q)
+
+```
+
+Here is a Kernel Tile IR version of the code, hand-translated from the Triton code.
+
+```mlir
+module {
+  func.func @kernel_unified_attention_2d_query_load(
+    %query_ptr,                      // [524288, 128] [2048, 256, 128] [num_tokens, num_query_heads, head_size]
+    %Q_lx_ptr,                       // [32, 128] [BLOCK_M, HEAD_SIZE_PADDED]
+    %HEAD_SIZE_PADDED: tl.constexpr, // 128, int, must be power of 2
+    %BLOCK_M: tl.constexpr,          // 32, int
+
+    %query_offset_ptr,               // [2, 256] [num_seqs, BLOCK_M * NumGrid0]
+    ) { grid = [2, 8] } {
+
+    // q_block_global_idx = tl.program_id(0)
+    // kv_head_idx = tl.program_id(1)
+    %q_block_global_idx = kt.gridid { dim = 0 : i32 } -> i32
+    %kv_head_idx = kt.gridid { dim = 1 : i32 } -> i32
+
+    // query_offset = tl.load(tl.make_block_ptr(query_offset_ptr, shape=[2, 256], strides=[256, 1], block_shape=[1, BLOCK_M], order=[0, 1], offsets=[q_block_global_idx, kv_head_idx * BLOCK_M]))
+    // query_offset = tl.broadcast_to(query_offset, [BLOCK_M])
+
+    // #set1 = affine_set<(d0, d1)> : (0 <= d0 < 2, 0 <= d1 < 256)
+    %query_offset_tile_ref = kt.tile_view %query_offset_ptr {
+      coordinate_set = #set1,
+      strides = [256, 1],
+      memory_space = HBM,
+      layout = #st.layout<stick_size=[32], stick_dim=[0]>
+    } : index -> tileref<2x256xi32>
+    // #set2 = affine_set<(d0, d1)> : (0 <= d0 < 1, 0 <= d1 < 32)
+    %query_offset_coretile_ref = kt.tile_grid_access %query_offset_tile_ref, [%q_block_global_idx, %kv_head_idx] { access_tile_set = #set2 } : tileref<2x256xi32>, [i32, i32] -> tileref<1x32xi32>
+    %tmp1 = tl.load %query_offset_coretile_ref : tileref<1x32xi32> -> tensor<1x32xi32>
+    %tmp2 = tensor.collapse_shape %tmp1 : tensor<1x32xi32> -> tensor<32xi32>
+    // #map1 = affine_map<(d0) -> (d0 * 128)
+    %query_offset = kt.offset_range #map1 (%tmp2) : tensor<32xi32> -> tensor<32xi32>
+
+    // offs_d = tl.arange(0, HEAD_SIZE_PADDED)
+    // query_offset = (
+    //     query_offset[:, None],
+    //     + offs_d[None, :]
+    // )
+    // # Q : (BLOCK_M, HEAD_SIZE_PADDED)
+    // Q = tl.load(query_ptr + query_offset)
+    // tl.store(tl.make_block_ptr(Q_lx_ptr, shape=[32, 128], strides=[128, 1], block_shape=[32, 128], order=[0, 1], offsets=[0, 0]), Q)
+
+    %offs_d = kt.arange %c0, %HEAD_SIZE_PADDED : tile<128xi32>
+    // #set3 = affine_set<(d0, d1)> : (0 <= d0 < 524288, 0 <= d1 < 128)
+    %Q_tile_ref = kt.tile_view %query_ptr {
+      coordinate_set = #set3,
+      strides = [128, 1],
+      memory_space = HBM,
+      layout = #kt.layout<stick_size=[64], stick_dim=[1]>
+    } : index -> tileref<524288x128xf16>
+    %Q_coretile_ref = kt.tile_indirect_access %Q_tile_ref, [%query_offset, %offs_d] : tileref<524288x128xf16>, [tensor<32xi32>, tensor<128xi32>] -> tileref<32x128xf16>
+    %Q = kt.load %Q_coretile_ref -> tile<32x128xf16>
+
+    // #ser4 = affine_set<(d0, d1>) : (0 <= d0 < 32, 0 <= d1 < 128)
+    %Q_lx_tile_ref = kt.tile_view %Q_lx_ptr {
+      coordinate_set = #set4,
+      strides = [128, 1],
+      memory_space = LX,
+      layout = #st.layout<stick_size=[64], stick_dim=[1]>
+    } : index -> tileref<32x128xf16>
+
+    kt.store %Q, %Q_lx_tile_ref : tile<32x128xf16>, tileref<32x128xf16>
+  }
+}
+```
+
 
 ## **Metrics **
 TBD
