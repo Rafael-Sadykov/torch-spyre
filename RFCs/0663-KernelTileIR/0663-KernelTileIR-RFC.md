@@ -401,7 +401,7 @@ module {
     // #map2 = affine_map<(d0, d1) : (d0 * 256 + d1)>
     %offset_1 = kt.offset_range #map2 (%grid1, %arange_0_256) : i32, tensor<256xi32> -> tensor<256xi32>
 
-    %dst_coretile_ref = kt.tile_indirect_access %dst_tile_ref, [%offset_1, %offset_0] : tileref<512x1024xf16>, [tensor<128xi32>, tensor<256xi32>] -> tileref<128x256xf16>
+    %dst_coretile_ref = kt.tile_indirect_access %dst_tile_ref, [%offset_0, %offset_1] : tileref<512x1024xf16>, [tensor<128xi32>, tensor<256xi32>] -> tileref<128x256xf16>
 
     kt.store %src_coretile, %dst_coretile_ref : tensor<128x256xf16>, tileref<128x256xf16>
 
