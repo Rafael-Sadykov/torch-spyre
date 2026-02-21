@@ -97,6 +97,8 @@ def infer_squeeze_geometry(
     strides = []
     current_stl = tensor.device_tensor_layout()
     stick_dim = current_stl.host_stick_dim()
+    if stick_dim is None:
+        raise ValueError("Squeezing of sparse tensors not implemented")
     dim_map = current_stl.dim_map
 
     for idx in range(tensor.dim()):
@@ -174,6 +176,9 @@ def infer_unsqueeze_geometry(tensor: torch.Tensor, dim: int):
 
     current_stl = tensor.device_tensor_layout()
     dim_map = current_stl.dim_map
+    stick_dim = current_stl.host_stick_dim()
+    if stick_dim is None:
+        raise ValueError("Unsqueezing of sparse tensors not implemented")
 
     for dim_idx in range(len(dim_map)):
         if dim_map[dim_idx] >= dim:
