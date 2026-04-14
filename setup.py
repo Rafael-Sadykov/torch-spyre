@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 import shutil
 from pathlib import Path
+import os
 from typing import cast
 
 os.environ.setdefault(
@@ -27,7 +27,8 @@ os.environ.setdefault(
 
 import glob
 
-from setuptools import Command, setup
+
+from setuptools import setup, Command
 
 PATH_NAME = "torch_spyre"
 PACKAGE_NAME = "torch_spyre"
@@ -115,7 +116,7 @@ if "RUNTIME_INSTALL_DIR" in os.environ:
 
 INCLUDE_DIRS += [os.environ["SEN_COMMON_HEADERS"]]
 
-LIBRARIES = ["sendnn", "sendnn_interface", "flex"]
+LIBRARIES = ["sendnn", "sendnn_interface", "flex", "dee_internal"]
 
 # FIXME: added no-deprecated as this fails in sentensor_shape.hpp
 # - we need to fix there
@@ -123,6 +124,11 @@ LIBRARIES = ["sendnn", "sendnn_interface", "flex"]
 # EXTRA_CXX_FLAGS = ["-g", "-Wall", "-Werror", "-Wno-deprecated"]
 # Set TORCH_SPYRE_DEBUG=1 to build with -O0 for easier debugging
 NO_OPT_BUILD = os.environ.get("TORCH_SPYRE_DEBUG", "0") == "1"
+
+# Profiler feature flag (EPIC #601)
+# Set USE_SPYRE_PROFILER=1 to enable profiling infrastructure
+USE_SPYRE_PROFILER = os.environ.get("USE_SPYRE_PROFILER", "0")
+SPYRE_KINETO_MODE = os.environ.get("SPYRE_KINETO_MODE", "AUTO")
 
 EXTRA_CXX_FLAGS = ["-g", "-Wall", "-Wno-deprecated", "-std=c++17"]
 if NO_OPT_BUILD:
@@ -150,8 +156,8 @@ class clean(Command):
 
 
 def run_codegen():
-    import importlib
     import sys
+    import importlib
 
     is_meta = any(
         cmd in sys.argv for cmd in ["dist_info", "egg_info", "install_egg_info"]
@@ -204,14 +210,22 @@ if __name__ == "__main__":
         if OUTPUT_CODEGEN_DIR:
             sources += list(OUTPUT_CODEGEN_DIR.glob("*.cpp"))
 
-        # Filenames that belong to the tiny hooks module.
-        # "shared" files are compiled into both _hooks.so and _C.so.
-        hooks_only_files = {"spyre_hooks.cpp"}
-        shared_files = {"spyre_device_enum.cpp", "logging.cpp"}
-        hooks_src_paths = [
-            p for p in sources if p.name in hooks_only_files | shared_files
-        ]
-        core_src_paths = [p for p in sources if p.name not in hooks_only_files]
+        # Add profiler sources if enabled
+        profiler_sources = []
+        if USE_SPYRE_PROFILER in ("1", "true", "on", "ON", "True"):
+            profiler_dir = CSRC_DIR / "profiler"
+            if profiler_dir.exists():
+                profiler_sources = list(profiler_dir.glob("*.cpp"))
+                sources += profiler_sources
+                print(f"[setup.py] Profiler enabled: adding {len(profiler_sources)} profiler sources")
+                print(f"[setup.py] Kineto mode: {SPYRE_KINETO_MODE}")
+            else:
+                print(f"[setup.py] Warning: USE_SPYRE_PROFILER=1 but profiler directory not found")
+
+        # Filenames that belong to the tiny hooks module
+        hook_files = {"spyre_hooks.cpp"}
+        hooks_src_paths = [p for p in sources if p.name in hook_files]
+        core_src_paths = [p for p in sources if p.name not in hook_files]
         hooks_src_paths = [
             p.relative_to(ROOT_DIR).as_posix() for p in sorted(hooks_src_paths)
         ]
@@ -219,22 +233,36 @@ if __name__ == "__main__":
             p.relative_to(ROOT_DIR).as_posix() for p in sorted(core_src_paths)
         ]
 
+        # Prepare define macros for core extension
+        core_define_macros = [
+            ("PACKAGE_NAME", f'"{PACKAGE_NAME}"'),
+            ("MODULE_NAME", f'"{PACKAGE_NAME}._C"'),
+            ("SPYRE_DEBUG_ENV", '"TORCH_SPYRE_DEBUG"'),
+            ("SPYRE_DOWNCAST_ENV", '"TORCH_SPYRE_DOWNCAST_WARN"'),
+            ("EAGER_MODE_ENV", '"EAGER_MODE"'),
+            ("BOOST_ALL_DYN_LINK", None),  # avoid static link to boost
+        ]
+
+        # Add profiler define if enabled
+        if USE_SPYRE_PROFILER in ("1", "true", "on", "ON", "True"):
+            core_define_macros.append(("USE_SPYRE_PROFILER", None))
+            print("[setup.py] Added USE_SPYRE_PROFILER compile definition")
+
+        # Prepare libraries list (may need to add profiler libs)
+        core_libraries = LIBRARIES.copy()
+        # Note: Profiler libraries (libAIUpti, libKineto) will be detected
+        # and linked by CMake when using the CMakeLists.txt approach.
+        # For direct setup.py builds, they would need to be added here.
+
         ext_modules = [
             CppExtension(
                 name=f"{PACKAGE_NAME}._C",
                 sources=core_src_paths,
                 include_dirs=[str(p) for p in INCLUDE_DIRS],
                 library_dirs=[str(p) for p in LIBRARY_DIRS],
-                libraries=LIBRARIES,
+                libraries=core_libraries,
                 extra_compile_args={"cxx": EXTRA_CXX_FLAGS},
-                define_macros=[
-                    ("PACKAGE_NAME", f'"{PACKAGE_NAME}"'),
-                    ("MODULE_NAME", f'"{PACKAGE_NAME}._C"'),
-                    ("SPYRE_DEBUG_ENV", '"TORCH_SPYRE_DEBUG"'),
-                    ("SPYRE_DOWNCAST_ENV", '"TORCH_SPYRE_DOWNCAST_WARN"'),
-                    ("EAGER_MODE_ENV", '"EAGER_MODE"'),
-                    ("BOOST_ALL_DYN_LINK", None),  # avoid static link to boost
-                ],
+                define_macros=core_define_macros,
             ),
             CppExtension(
                 name=f"{PACKAGE_NAME}._hooks",
