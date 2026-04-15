@@ -116,7 +116,7 @@ if "RUNTIME_INSTALL_DIR" in os.environ:
 
 INCLUDE_DIRS += [os.environ["SEN_COMMON_HEADERS"]]
 
-LIBRARIES = ["sendnn", "sendnn_interface", "flex", "dee_internal"]
+LIBRARIES = ["sendnn", "sendnn_interface", "flex"]
 
 # FIXME: added no-deprecated as this fails in sentensor_shape.hpp
 # - we need to fix there
