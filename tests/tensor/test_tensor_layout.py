@@ -171,26 +171,50 @@ class TestSpyreTensorLayout(TestCase):
             cpu_result, compiled_result, rtol=0.001, atol=0.00001
         )
 
-    def test_add_with_incompatible_mixed_layout_dim_orders(self):
+    def test_spyre_tensor_layout_guard(self):
         """
-        Compiled add where x and y have incompatible device layouts.
-
-        When we implement https://github.com/torch-spyre/torch-spyre/issues/738,
-        this test will be updated to expect cpu_result and compiled_result to be equal.
+        Verify that torch.compile recompiles when SpyreTensorLayout changes
+        between calls. Two tensors with same shape but different layout must
+        produce separate compiled graphs — regression test for issue #1297.
         """
-        x = torch.rand(3, 2, 2048, dtype=torch.float16)
-        y = torch.rand(3, 2, 2048, dtype=torch.float16)
-        x_stl = SpyreTensorLayout(x.size(), x.stride(), torch.float16, [1, 0, 2])
-        y_stl = SpyreTensorLayout(x.size(), x.stride(), torch.float16, [2, 1, 0])
+        x = torch.rand([512, 256], dtype=torch.float16)
+        stl_default = SpyreTensorLayout([512, 256], torch.float16)
+        stl_custom = SpyreTensorLayout(x.size(), x.stride(), torch.float16, [1, 0])
         _ = x.to("spyre")  # required for lazy device initialization
-        x_dev = x.to(device_layout=x_stl)
-        y_dev = y.to(device_layout=y_stl)
-        compiled = torch.compile(torch.add)
-        with self.assertRaises(RuntimeError) as context:
-            _ = compiled(x_dev, y_dev).cpu()
-        self.assertIn(
-            "pointwise op with nonuniform stick indexing",
-            str(context.exception),
+
+        tensor_default = x.to(device_layout=stl_default)
+        tensor_custom = x.to(device_layout=stl_custom)
+
+        def simple_add(a):
+            return a + a
+
+        torch._dynamo.reset()
+        torch._dynamo.utils.counters.clear()
+        compiled = torch.compile(simple_add)
+
+        # call 1 — default layout → compiles new graph
+        compiled(tensor_default)
+        count_after_default = torch._dynamo.utils.counters["stats"]["calls_captured"]
+
+        # call 2 — different layout → guard fails → recompile expected
+        compiled(tensor_custom)
+        count_after_custom = torch._dynamo.utils.counters["stats"]["calls_captured"]
+
+        self.assertEqual(
+            count_after_custom,
+            count_after_default + 1,
+            "Expected recompilation when SpyreTensorLayout changes between calls",
+        )
+
+        # call 3 — same custom layout again → cache hit → no recompile expected
+        compiled(tensor_custom)
+        count_after_custom_second = torch._dynamo.utils.counters["stats"][
+            "calls_captured"
+        ]
+        self.assertEqual(
+            count_after_custom_second,
+            count_after_custom,
+            "Expected cache hit when SpyreTensorLayout is the same as previous call",
         )
 
 

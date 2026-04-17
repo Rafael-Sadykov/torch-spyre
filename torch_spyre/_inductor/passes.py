@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import inspect
+import io
+import logging
 from typing import Optional, Any, Callable, List
 from abc import abstractmethod
 
@@ -22,22 +24,51 @@ from torch._inductor.custom_graph_pass import (
     CustomGraphPass,
     get_hash_for_files,
 )
-from torch._inductor.ir import Operation
+from torch._inductor.ir import ComputedBuffer, Operation
 from torch._inductor.scheduler import BaseSchedulerNode
+
+from .logging_utils import get_inductor_logger
 
 from .padding import insert_padding
 from .temp_passes import (
     bmm_unflatten_pass,
     mm_to_bmm_pass,
-    relayout_linear_weights,
     replace_scalar_with_tensor,
 )
 from . import config
 from .stickify import propagate_mutation_layouts, propagate_spyre_tensor_layouts
+from .insert_restickify import insert_restickify
 from .core_division import core_division_planning
+from .pass_utils import apply_splits_from_index_coeff, iteration_space_from_op
 from .scratchpad import scratchpad_planning
 from .fusion import spyre_fuse_nodes
 from .constants import DEVICE_NAME
+from .deadcode_elimination import deadcode_elimination
+
+
+logger = get_inductor_logger("passes")
+
+
+def _format_operations(operations: list[Operation]) -> str:
+    buf = io.StringIO()
+    for op in operations:
+        buf.write(f"{op.get_operation_name()}: {type(op).__name__}")
+        if isinstance(op, ComputedBuffer):
+            buf.write(f"\n  layout={op.layout}")
+            if allocation := getattr(op.layout, "allocation", None):
+                buf.write(f"\n  allocation={allocation}")
+            if splits := getattr(op, "op_it_space_splits", None):
+                rw = op.get_read_writes()
+                write_index = next(iter(rw.writes)).index
+                read_index = next((d.index for d in rw.reads), write_index)
+                it_space = iteration_space_from_op(op)
+                readable_splits = apply_splits_from_index_coeff(
+                    splits, write_index, read_index, it_space
+                )
+                buf.write(f"\n  op_it_space_splits={readable_splits}")
+            buf.write(f"\n  {op.data}")
+        buf.write("\n\n")
+    return buf.getvalue()
 
 
 def _maybe_run_graph_pass(pass_fn, graph: torch.fx.graph.Graph) -> None:
@@ -97,7 +128,6 @@ class CustomPostPasses(CustomGraphPass):
     """
     passes: List[Callable[[torch.fx.graph.Graph], None]] = [
         replace_scalar_with_tensor,
-        relayout_linear_weights,
         mm_to_bmm_pass.apply,
         bmm_unflatten_pass.apply,
     ]
@@ -185,14 +215,24 @@ class CustomPreSchedulingPasses(CustomGraphPass):
         if not has_spyre_device:
             return
 
+        if logger.isEnabledFor(logging.INFO):
+            logger.info("BEFORE PRE-SCHEDULING\n%s", _format_operations(operations))
+
+        deadcode_elimination(operations)
         propagate_spyre_tensor_layouts(operations)
+        insert_restickify(operations)
         core_division_planning(operations)
         if config.lx_planning:
             scratchpad_planning(operations)
 
+        if logger.isEnabledFor(logging.INFO):
+            logger.info("AFTER PRE-SCHEDULING\n%s", _format_operations(operations))
+
     def uuid(self) -> Optional[Any]:
         files = [
+            inspect.getfile(deadcode_elimination),
             inspect.getfile(propagate_spyre_tensor_layouts),
+            inspect.getfile(insert_restickify),
             inspect.getfile(core_division_planning),
             inspect.getfile(scratchpad_planning),
         ]
