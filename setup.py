@@ -14,7 +14,6 @@
 
 import os
 import shutil
-import subprocess
 from pathlib import Path
 from typing import cast
 
@@ -124,40 +123,6 @@ class clean(Command):
             shutil.rmtree(str(BUILD_DIR), ignore_errors=True)
 
 
-class build(Command):
-    """Custom build command for CMake + profiler (Issue #927)"""
-
-    user_options = []
-
-    def initialize_options(self):
-        self.build_temp = None
-
-    def finalize_options(self):
-        self.build_temp = str(BUILD_DIR)
-
-    def run(self):
-        build_dir = Path(self.build_temp)
-        build_dir.mkdir(parents=True, exist_ok=True)
-
-        configure_cmd = [
-            "cmake",
-            "-B",
-            str(build_dir),
-            "-S",
-            str(ROOT_DIR),
-            f"-DUSE_SPYRE_PROFILER={'ON' if USE_SPYRE_PROFILER else 'OFF'}",
-            f"-DSPYRE_KINETO_MODE={SPYRE_KINETO_MODE}",
-        ]
-        if NO_OPT_BUILD:
-            configure_cmd.append("-DCMAKE_BUILD_TYPE=Debug")
-
-        print(f"[setup.py] Configuring with USE_SPYRE_PROFILER={USE_SPYRE_PROFILER}")
-        print(f"[setup.py] SPYRE_KINETO_MODE={SPYRE_KINETO_MODE}")
-
-        subprocess.check_call(configure_cmd, cwd=ROOT_DIR)
-        subprocess.check_call(["cmake", "--build", str(build_dir)], cwd=ROOT_DIR)
-
-
 if __name__ == "__main__":
     import sys
 
@@ -172,7 +137,7 @@ if __name__ == "__main__":
             entry_points={"torch.backends": ["torch_spyre = torch_spyre:_autoload"]},
         )
     else:
-        from torch.utils.cpp_extension import BuildExtension, CppExtension
+        from torch.utils.cpp_extension import CppExtension
 
         sources = list(CSRC_DIR.glob("*.cpp"))
 
@@ -199,7 +164,7 @@ if __name__ == "__main__":
                 include_dirs=[str(p) for p in INCLUDE_DIRS],
                 library_dirs=[str(p) for p in LIBRARY_DIRS],
                 libraries=LIBRARIES,
-                extra_compile_args={"cxx": EXTRA_CXX_FLAGS},
+                extra_compile_args=EXTRA_CXX_FLAGS,  # ← Fixed: pass as list, not dict
                 define_macros=[
                     ("PACKAGE_NAME", f'"{PACKAGE_NAME}"'),
                     ("MODULE_NAME", f'"{PACKAGE_NAME}._C"'),
@@ -217,7 +182,7 @@ if __name__ == "__main__":
                 include_dirs=[str(p) for p in INCLUDE_DIRS],
                 library_dirs=[str(p) for p in LIBRARY_DIRS],
                 libraries=LIBRARIES,
-                extra_compile_args={"cxx": EXTRA_CXX_FLAGS},
+                extra_compile_args=EXTRA_CXX_FLAGS,  # ← Fixed
                 define_macros=[
                     ("PACKAGE_NAME", f'"{PACKAGE_NAME}"'),
                     ("MODULE_NAME", f'"{PACKAGE_NAME}._hooks"'),
@@ -229,35 +194,10 @@ if __name__ == "__main__":
             ),
         ]
 
-        _BuildExtension = BuildExtension.with_options(
-            no_python_abi_suffix=True, verbose=True
-        )
-
-        class PermanentBuildExtension(_BuildExtension):
-            def finalize_options(self):
-                super().finalize_options()
-                # Fix for --dry-run + custom build command
-                if not hasattr(self, "build_lib"):
-                    self.build_lib = str(ROOT_DIR / "build" / "lib")
-                self.build_temp = str(BUILD_DIR)
-
-            def build_extension(self, ext):
-                original_build_temp = self.build_temp
-                self.build_temp = os.path.join(original_build_temp, ext.name)
-                os.makedirs(self.build_temp, exist_ok=True)
-                try:
-                    super().build_extension(ext)
-                finally:
-                    self.build_temp = original_build_temp
-
         setup(
             name=PACKAGE_NAME,
             version=version,
             ext_modules=ext_modules,
-            cmdclass={
-                "build_ext": PermanentBuildExtension,
-                "build": build,
-                "clean": clean,
-            },
+            cmdclass={"clean": clean},
             entry_points={"torch.backends": ["torch_spyre = torch_spyre:_autoload"]},
         )
