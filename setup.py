@@ -137,7 +137,7 @@ if __name__ == "__main__":
             entry_points={"torch.backends": ["torch_spyre = torch_spyre:_autoload"]},
         )
     else:
-        from torch.utils.cpp_extension import CppExtension
+        from torch.utils.cpp_extension import BuildExtension, CppExtension
 
         sources = list(CSRC_DIR.glob("*.cpp"))
 
@@ -164,7 +164,7 @@ if __name__ == "__main__":
                 include_dirs=[str(p) for p in INCLUDE_DIRS],
                 library_dirs=[str(p) for p in LIBRARY_DIRS],
                 libraries=LIBRARIES,
-                extra_compile_args=EXTRA_CXX_FLAGS,  # ← Fixed: pass as list, not dict
+                extra_compile_args=EXTRA_CXX_FLAGS,
                 define_macros=[
                     ("PACKAGE_NAME", f'"{PACKAGE_NAME}"'),
                     ("MODULE_NAME", f'"{PACKAGE_NAME}._C"'),
@@ -182,7 +182,7 @@ if __name__ == "__main__":
                 include_dirs=[str(p) for p in INCLUDE_DIRS],
                 library_dirs=[str(p) for p in LIBRARY_DIRS],
                 libraries=LIBRARIES,
-                extra_compile_args=EXTRA_CXX_FLAGS,  # ← Fixed
+                extra_compile_args=EXTRA_CXX_FLAGS,
                 define_macros=[
                     ("PACKAGE_NAME", f'"{PACKAGE_NAME}"'),
                     ("MODULE_NAME", f'"{PACKAGE_NAME}._hooks"'),
@@ -194,10 +194,18 @@ if __name__ == "__main__":
             ),
         ]
 
+        class PermanentBuildExtension(BuildExtension):
+            def finalize_options(self):
+                super().finalize_options()
+                self.build_temp = str(BUILD_DIR)
+
         setup(
             name=PACKAGE_NAME,
             version=version,
             ext_modules=ext_modules,
-            cmdclass={"clean": clean},
+            cmdclass={
+                "build_ext": PermanentBuildExtension,
+                "clean": clean,
+            },
             entry_points={"torch.backends": ["torch_spyre = torch_spyre:_autoload"]},
         )
