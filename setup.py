@@ -194,10 +194,24 @@ if __name__ == "__main__":
             ),
         ]
 
+        _BuildExtension = BuildExtension.with_options(
+            no_python_abi_suffix=True, verbose=True
+        )
+
         class PermanentBuildExtension(BuildExtension):
             def finalize_options(self):
                 super().finalize_options()
                 self.build_temp = str(BUILD_DIR)
+
+            def build_extension(self, ext):
+                # Use a per-extension subdirectory so each gets its own build.ninja
+                original_build_temp = self.build_temp
+                self.build_temp = os.path.join(original_build_temp, ext.name)
+                os.makedirs(self.build_temp, exist_ok=True)
+                try:
+                    super().build_extension(ext)
+                finally:
+                    self.build_temp = original_build_temp
 
         setup(
             name=PACKAGE_NAME,
