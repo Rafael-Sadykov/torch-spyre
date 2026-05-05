@@ -14,18 +14,15 @@
 
 import os
 import shutil
+import subprocess
 from pathlib import Path
 from typing import cast
 
-os.environ.setdefault(
-    "TORCH_DEVICE_BACKEND_AUTOLOAD", "0"
-)  # must be before torch import
+os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
 os.environ.setdefault(
     "SEN_COMMON_HEADERS", str(Path(__file__).resolve().parent.parent / "flex")
 )
 
-
-import glob
 
 from setuptools import Command, setup
 
@@ -44,21 +41,22 @@ def get_torch_spyre_version() -> str:
 version = get_torch_spyre_version()
 
 
-def check_libflex():
-    ld_library_paths = os.environ.get("LD_LIBRARY_PATH", "").split(":")
-    for path in ld_library_paths:
-        if glob.glob(os.path.join(path, "libflex.so")):
-            return True
-    return False
+def env_flag(name: str, default: str = "0") -> bool:
+    value = os.environ.get(name, default)
+    return value.strip().lower() in {"1", "true", "on", "yes"}
+
+
+# === Issue #927: Spyre Profiler Support ===
+USE_SPYRE_PROFILER = env_flag("USE_SPYRE_PROFILER", "0")
+SPYRE_KINETO_MODE = os.environ.get("SPYRE_KINETO_MODE", "AUTO").strip().upper()
 
 
 ROOT_DIR = Path(__file__).absolute().parent
 CSRC_DIR = ROOT_DIR / PATH_NAME / "csrc"
+BUILD_DIR = ROOT_DIR / "build"
 
 
-# Automatically download json.hpp if not present
 def maybe_download_nlohmann_json():
-    """return path to header files"""
     import urllib.request
 
     NLOHMANN_URL = "https://raw.githubusercontent.com/nlohmann/json/v3.11.2/single_include/nlohmann/json.hpp"
@@ -76,13 +74,8 @@ def maybe_download_nlohmann_json():
     return NLOHMANN_INC_DIR
 
 
-INCLUDE_DIRS = [
-    CSRC_DIR,
-    # "tracy/public"
-]
+INCLUDE_DIRS = [CSRC_DIR]
 LIBRARY_DIRS = []
-
-
 INCLUDE_DIRS += [maybe_download_nlohmann_json()]
 
 cmake_include_path = os.environ.get("CMAKE_INCLUDE_PATH", "")
@@ -93,57 +86,31 @@ cmake_library_path = os.environ.get("CMAKE_LIBRARY_PATH", "")
 extra_library_dirs = cmake_library_path.split(":") if cmake_library_path else []
 LIBRARY_DIRS += [Path(p) for p in extra_library_dirs if p]
 
-COMPILE_AIUPTI = True
-
 if "RUNTIME_INSTALL_DIR" in os.environ:
-    # take lower precedence than CMAKE_LIBRARY_PATH and CMAKE_INCLUDE_PATH
     RUNTIME_DIR = Path(os.environ["RUNTIME_INSTALL_DIR"])
     SENLIB_DIR = Path(os.environ["SENLIB_INSTALL_DIR"])
     DEEPTOOLS_DIR = Path(os.environ["DEEPTOOLS_INSTALL_DIR"])
-    import torch
-
-    KINETO_INCLUDE_DIR = Path(torch.__path__[0]) / "include" / "kineto"
-    COMMON_INCLUDE_DIR = Path(os.environ["SEN_COMMON_HEADERS"])
-
     INCLUDE_DIRS += [
         RUNTIME_DIR / "include",
-    ]
-    INCLUDE_DIRS += [
         RUNTIME_DIR / "include" / "concurrentqueue" / "moodycamel",
-    ]
-    INCLUDE_DIRS += [
         SENLIB_DIR / "include",
-    ]
-    INCLUDE_DIRS += [
         DEEPTOOLS_DIR / "include",
     ]
-    INCLUDE_DIRS += [
-        KINETO_INCLUDE_DIR,
-        COMMON_INCLUDE_DIR / "libaiupti",
-    ]
-    if os.environ.get("LIBAIUPTI_INSTALL_DIR"):
-        LIBAIUPTI_DIR = Path(os.environ["LIBAIUPTI_INSTALL_DIR"])
-        LIBRARY_DIRS += [LIBAIUPTI_DIR / "lib"]
-
     LIBRARY_DIRS += [RUNTIME_DIR / "lib"]
 
 INCLUDE_DIRS += [os.environ["SEN_COMMON_HEADERS"]]
 
-LIBRARIES = ["sendnn", "sendnn_interface", "aiupti", "flex"]
+LIBRARIES = ["sendnn", "sendnn_interface", "flex"]
 
-# FIXME: added no-deprecated as this fails in sentensor_shape.hpp
-# - we need to fix there
-# Note that we always compile with debug info
-# EXTRA_CXX_FLAGS = ["-g", "-Wall", "-Werror", "-Wno-deprecated"]
-# Set TORCH_SPYRE_DEBUG=1 to build with -O0 for easier debugging
 NO_OPT_BUILD = os.environ.get("TORCH_SPYRE_DEBUG", "0") == "1"
-
 EXTRA_CXX_FLAGS = ["-g", "-Wall", "-Wno-deprecated", "-std=c++17"]
 if NO_OPT_BUILD:
     EXTRA_CXX_FLAGS += ["-O0"]
 
 
 class clean(Command):
+    user_options = []
+
     def initialize_options(self):
         pass
 
@@ -151,16 +118,44 @@ class clean(Command):
         pass
 
     def run(self):
-        # Remove torch_spyre extension
         for path in (ROOT_DIR / PATH_NAME).glob("**/*.so"):
             path.unlink()
-        # Remove build directory
-        build_dirs = [
-            ROOT_DIR / "build",
+        if BUILD_DIR.exists():
+            shutil.rmtree(str(BUILD_DIR), ignore_errors=True)
+
+
+class build(Command):
+    """Custom build command for CMake + profiler (Issue #927)"""
+
+    user_options = []
+
+    def initialize_options(self):
+        self.build_temp = None
+
+    def finalize_options(self):
+        self.build_temp = str(BUILD_DIR)
+
+    def run(self):
+        build_dir = Path(self.build_temp)
+        build_dir.mkdir(parents=True, exist_ok=True)
+
+        configure_cmd = [
+            "cmake",
+            "-B",
+            str(build_dir),
+            "-S",
+            str(ROOT_DIR),
+            f"-DUSE_SPYRE_PROFILER={'ON' if USE_SPYRE_PROFILER else 'OFF'}",
+            f"-DSPYRE_KINETO_MODE={SPYRE_KINETO_MODE}",
         ]
-        for path in build_dirs:
-            if path.exists():
-                shutil.rmtree(str(path), ignore_errors=True)
+        if NO_OPT_BUILD:
+            configure_cmd.append("-DCMAKE_BUILD_TYPE=Debug")
+
+        print(f"[setup.py] Configuring with USE_SPYRE_PROFILER={USE_SPYRE_PROFILER}")
+        print(f"[setup.py] SPYRE_KINETO_MODE={SPYRE_KINETO_MODE}")
+
+        subprocess.check_call(configure_cmd, cwd=ROOT_DIR)
+        subprocess.check_call(["cmake", "--build", str(build_dir)], cwd=ROOT_DIR)
 
 
 if __name__ == "__main__":
@@ -172,31 +167,30 @@ if __name__ == "__main__":
 
     if is_meta:
         setup(
-            entry_points={
-                "torch.backends": [
-                    "torch_spyre = torch_spyre:_autoload",
-                ],
-            },
+            name=PACKAGE_NAME,
+            version=version,
+            entry_points={"torch.backends": ["torch_spyre = torch_spyre:_autoload"]},
         )
     else:
         from torch.utils.cpp_extension import BuildExtension, CppExtension
 
-        sources = list(CSRC_DIR.rglob("*.cpp"))
+        sources = list(CSRC_DIR.glob("*.cpp"))
 
-        # Filenames that belong to the tiny hooks module.
-        # "shared" files are compiled into both _hooks.so and _C.so.
         hooks_only_files = {"spyre_hooks.cpp"}
         shared_files = {"spyre_device_enum.cpp", "logging.cpp"}
+
         hooks_src_paths = [
-            p for p in sources if p.name in hooks_only_files | shared_files
-        ]
-        core_src_paths = [p for p in sources if p.name not in hooks_only_files]
-        hooks_src_paths = [
-            p.relative_to(ROOT_DIR).as_posix() for p in sorted(hooks_src_paths)
+            p.relative_to(ROOT_DIR).as_posix()
+            for p in sources
+            if p.name in hooks_only_files | shared_files
         ]
         core_src_paths = [
-            p.relative_to(ROOT_DIR).as_posix() for p in sorted(core_src_paths)
+            p.relative_to(ROOT_DIR).as_posix()
+            for p in sources
+            if p.name not in hooks_only_files
         ]
+
+        profiler_define = [("USE_SPYRE_PROFILER", None)] if USE_SPYRE_PROFILER else []
 
         ext_modules = [
             CppExtension(
@@ -212,13 +206,8 @@ if __name__ == "__main__":
                     ("SPYRE_DEBUG_ENV", '"TORCH_SPYRE_DEBUG"'),
                     ("SPYRE_DOWNCAST_ENV", '"TORCH_SPYRE_DOWNCAST_WARN"'),
                     ("EAGER_MODE_ENV", '"EAGER_MODE"'),
-                    ("BOOST_ALL_DYN_LINK", None),  # avoid static link to boost
-                    *(
-                        [("HAS_AIUPTI", None)]
-                        if os.environ.get("USE_SPYRE_PROFILER")
-                        else []
-                    ),
-                    *([("USE_KINETO", None)] if KINETO_INCLUDE_DIR.is_dir() else []),
+                    ("BOOST_ALL_DYN_LINK", None),
+                    *profiler_define,
                     ("FMT_HEADER_ONLY", None),
                 ],
             ),
@@ -235,12 +224,10 @@ if __name__ == "__main__":
                     ("SPYRE_DEBUG_ENV", '"TORCH_SPYRE_DEBUG"'),
                     ("SPYRE_DOWNCAST_ENV", '"TORCH_SPYRE_DOWNCAST_WARN"'),
                     ("EAGER_MODE_ENV", '"EAGER_MODE"'),
-                    ("BOOST_ALL_DYN_LINK", None),  # avoid static link to boost
+                    ("BOOST_ALL_DYN_LINK", None),
                 ],
             ),
         ]
-
-        BUILD_DIR = ROOT_DIR / "build"
 
         _BuildExtension = BuildExtension.with_options(
             no_python_abi_suffix=True, verbose=True
@@ -249,10 +236,12 @@ if __name__ == "__main__":
         class PermanentBuildExtension(_BuildExtension):
             def finalize_options(self):
                 super().finalize_options()
+                # Fix for --dry-run + custom build command
+                if not hasattr(self, "build_lib"):
+                    self.build_lib = str(ROOT_DIR / "build" / "lib")
                 self.build_temp = str(BUILD_DIR)
 
             def build_extension(self, ext):
-                # Use a per-extension subdirectory so each gets its own build.ninja
                 original_build_temp = self.build_temp
                 self.build_temp = os.path.join(original_build_temp, ext.name)
                 os.makedirs(self.build_temp, exist_ok=True)
@@ -262,14 +251,13 @@ if __name__ == "__main__":
                     self.build_temp = original_build_temp
 
         setup(
+            name=PACKAGE_NAME,
+            version=version,
             ext_modules=ext_modules,
             cmdclass={
                 "build_ext": PermanentBuildExtension,
+                "build": build,
                 "clean": clean,
             },
-            entry_points={
-                "torch.backends": [
-                    "torch_spyre = torch_spyre:_autoload",
-                ],
-            },
+            entry_points={"torch.backends": ["torch_spyre = torch_spyre:_autoload"]},
         )
