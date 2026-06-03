@@ -241,6 +241,7 @@ register_fallback_default(
         aten.arange,
         aten.sin,
         aten.cos,
+        aten.ne.Scalar_out,
         aten.embedding.default,
         aten.isin,
         aten.tril,
@@ -251,6 +252,7 @@ register_fallback_default(
         aten.bitwise_or.Tensor_out,
         aten.argmax.default,
         aten.argmin.default,
+        aten.index_copy.out,
     ]
 )
 
