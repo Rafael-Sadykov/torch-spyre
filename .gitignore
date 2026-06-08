@@ -393,4 +393,4 @@ test/*.txt
 test/*.json
 
 .*env*
-stubs
+stubssetup.py.original
