@@ -76,6 +76,11 @@ def maybe_download_nlohmann_json():
 
 
 INCLUDE_DIRS = [CSRC_DIR]
+# Add profiler headers when enabled
+if USE_SPYRE_PROFILER:
+    INCLUDE_DIRS.append(CSRC_DIR / "profiler")
+
+
 LIBRARY_DIRS = []
 INCLUDE_DIRS += [maybe_download_nlohmann_json()]
 
@@ -145,8 +150,62 @@ if use_new_system:
     LIBRARIES = ["flex"]
 else:
     LIBRARIES = ["sendnn", "sendnn_interface", "flex"]
+
 if use_spyre_ccl:
     LIBRARIES.append("spyre_comms")
+
+# === Kineto / Profiler Libraries (for wheel installation) ===
+if USE_SPYRE_PROFILER:
+    # When using kineto-spyre wheel
+    if SPYRE_KINETO_MODE in ("WHEEL", "AUTO"):
+        LIBRARIES.extend(["aiupti", "kineto"])
+    # When using upstream PyTorch Kineto
+    elif SPYRE_KINETO_MODE == "UPSTREAM":
+        LIBRARIES.append("kineto")
+
+# === Validate that Kineto libraries are available when profiler is enabled ===
+if USE_SPYRE_PROFILER:
+    import sysconfig
+
+    # Build list of possible library directories
+    possible_lib_dirs = list(LIBRARY_DIRS)
+
+    # Add common locations where pip/uv installs libraries
+    venv_lib = Path(sysconfig.get_path("purelib")).parent / "lib"
+    if venv_lib.exists():
+        possible_lib_dirs.append(venv_lib)
+
+    # Also check torch installation directory (sometimes libraries are there)
+    try:
+        import torch
+        torch_lib_dir = Path(torch.__file__).parent / "lib"
+        if torch_lib_dir.exists():
+            possible_lib_dirs.append(torch_lib_dir)
+    except Exception:
+        pass
+
+    # Check if any of the required libraries exist
+    kineto_found = any(
+        (lib_dir / "libkineto.so").exists() or (lib_dir / "libaiupti.so").exists()
+        for lib_dir in possible_lib_dirs
+    )
+
+    if not kineto_found:
+        raise RuntimeError(
+            "\n"
+            "ERROR: USE_SPYRE_PROFILER=1 is enabled, but libkineto / libaiupti were not found.\n\n"
+            "Please install the matching kineto-spyre wheel:\n\n"
+            "    uv pip install --no-deps --force-reinstall \\\n"
+            "        https://github.com/IBM/kineto-spyre/releases/download/"
+            "torch-2.11.0.aiu.kineto.1.1.2/"
+            "torch-2.11.0+aiu.kineto.1.1.2-cp312-cp312-linux_x86_64.whl\n\n"
+            "Find matching wheels for other PyTorch versions here:\n"
+            "    https://github.com/IBM/kineto-spyre/releases\n"
+        )
+
+if USE_SPYRE_PROFILER:
+    print("✓ Spyre Profiler support enabled (USE_SPYRE_PROFILER=1)")
+
 
 NO_OPT_BUILD = os.environ.get("TORCH_SPYRE_DEBUG", "0") == "1"
 EXTRA_CXX_FLAGS = ["-g", "-Wall", "-Wno-deprecated", "-std=c++20"]
@@ -188,6 +247,12 @@ if __name__ == "__main__":
         from torch.utils.cpp_extension import BuildExtension, CppExtension
 
         sources = list(CSRC_DIR.glob("*.cpp"))
+        # Add profiler sources when USE_SPYRE_PROFILER=1
+        if USE_SPYRE_PROFILER:
+            PROFILER_SRC_DIR = CSRC_DIR / "profiler"
+            if PROFILER_SRC_DIR.exists():
+                sources += list(PROFILER_SRC_DIR.glob("*.cpp"))
+
         distributed_sources = (
             list(DISTRIBUTED_SRC_DIR.glob("*.cpp")) if use_spyre_ccl else []
         )
@@ -222,7 +287,14 @@ if __name__ == "__main__":
         if use_new_system:
             base_define_macros.append(("USE_FLEX_NAMESPACE", None))
 
-        profiler_define = [("USE_SPYRE_PROFILER", None)] if USE_SPYRE_PROFILER else []
+        # profiler_define = [("USE_SPYRE_PROFILER", None)] if USE_SPYRE_PROFILER else []
+        profiler_define = []
+        if USE_SPYRE_PROFILER:
+            profiler_define = [
+                ("USE_SPYRE_PROFILER", None),
+                ("HAS_AIUPTI", None),
+                ("USE_KINETO", None),
+            ]
 
         ext_modules = [
             CppExtension(
